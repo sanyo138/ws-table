@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1d2433">
+<meta name="referrer" content="no-referrer">
+<title>WS 卓 (外から P2)</title>
+<style>
+  #wsr { padding: 16px; font: 16px/1.6 system-ui, sans-serif; }
+  #wsr h2 { font-size: 19px; margin: 0 0 8px; }
+  #wsrMsg { color: #ffd479; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"
+        integrity="sha384-nlUQ8ZqCbvStErob+biJNzSgltf6urV3VGqhfIfzhmg9RXmpeRm76ELw0pYnKlTR"
+        crossorigin="anonymous"></script>
+</head>
+<body style="margin:0;background:#1d2433;color:#e8ecf3">
+<div id="wsr"><h2>WS 卓 につないでいます…</h2><div id="wsrMsg"></div>
+<p style="font-size:13px;color:#aab3c8">相手の PC の卓に、P2 としてつなぎます。PC の人から届いたリンク (#peer=…&amp;code=…) で開いてください。</p></div>
+<script>
+// 外の相手の画面。PC の卓の画面 (index.html・app.js・app.css) は、つないでから PC から受け取って動かす
+// (ここには置かない。卓を直しても、このページを置き直す必要はない)。
+// 卓の API (fetch / EventSource / カードの絵) を WebRTC のデータチャネルで PC の中継 (/relay) に取り次ぐ。
+(function () {
+  'use strict';
+  const H = new URLSearchParams(location.hash.slice(1));
+  const SS = {
+    get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); } catch (e) { } },
+  };
+  // 卓の中の「使い方を変える」などでアドレスの # が消えても、同じタブなら続けられるように覚えておく
+  if (H.get('peer') && H.get('code')) { SS.set('wsr_peer', H.get('peer')); SS.set('wsr_code', H.get('code')); }
+  const peerId = H.get('peer') || SS.get('wsr_peer');
+  const code = H.get('code') || SS.get('wsr_code');
+  const msg = t => { const el = document.getElementById('wsrMsg'); if (el) el.textContent = t; };
+  if (!peerId || !code) { msg('リンクに #peer=… と code=… がありません'); return; }
+  if (typeof Peer === 'undefined') { msg('PeerJS を読み込めませんでした (インターネットにつながっているか確かめて、開き直してください)'); return; }
+
+  let conn = null, ready = false, appLoaded = false, giveUp = false, seq = 0, retryT = null, fakeES = null;
+  const pending = new Map();
+  const peer = new Peer({ debug: 1 });
+
+  function retry(ms) { clearTimeout(retryT); if (!giveUp) retryT = setTimeout(dial, ms); }
+  function dial() {
+    if (giveUp || ready) return;
+    if (peer.disconnected) { peer.reconnect(); return; } // open の後にもう一度 dial する
+    const c = peer.connect(peerId, { reliable: true });
+    c.on('open', () => c.send({ t: 'hello', code }));
+    c.on('data', d => onData(c, d));
+    c.on('close', () => onClose(c));
+    c.on('error', () => onClose(c));
+  }
+  peer.on('open', dial);
+  peer.on('disconnected', () => { if (!peer.destroyed) setTimeout(() => peer.reconnect(), 3000); });
+  peer.on('error', e => {
+    const t = e && e.type;
+    if (t === 'peer-unavailable') { if (!appLoaded) msg('PC の中継が見つかりません。PC で中継の画面が開いているか確かめてください (5秒ごとにもう一度)'); retry(5000); }
+    else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(t)) { if (!appLoaded) msg('PeerJS の窓口につながりません。5秒ごとにもう一度…'); retry(5000); }
+    else if (!appLoaded) msg('エラー: ' + t);
+  });
+
+  function onData(c, d) {
+    if (!d || typeof d !== 'object') return;
+    if (d.t === 'ok') {
+      conn = c; ready = true;
+      if (!appLoaded) loadApp(); else if (fakeES) c.send({ t: 'sub' });
+      pump();
+    } else if (d.t === 'bye') {
+      giveUp = true; ready = false;
+      if (appLoaded) alert(d.why); else msg(d.why);
+    } else if (d.t === 'res' && c === conn) {
+      const p = pending.get(d.id);
+      if (p) { pending.delete(d.id); clearTimeout(p.timer); p.ok(d); }
+    } else if (d.t === 'ev' && c === conn && fakeES) {
+      fakeES._fire(d.ev, d.data);
+    }
+  }
+  function onClose(c) {
+    if (c === conn) {
+      conn = null; ready = false;
+      for (const p of pending.values()) { clearTimeout(p.timer); p.ng(new Error('切れました')); }
+      pending.clear();
+      if (fakeES) fakeES._fire('error', '');
+    }
+    if (!ready) retry(3000);
+  }
+  function request(m, path, body) {
+    return new Promise((ok, ng) => {
+      if (!ready) return ng(new Error('つながっていません'));
+      const id = ++seq;
+      const timer = setTimeout(() => { pending.delete(id); ng(new Error('返事がありません')); }, 20000);
+      pending.set(id, { ok, ng, timer });
+      try { conn.send({ t: 'req', id, m, path, body: typeof body === 'string' ? body : undefined }); }
+      catch (e) { pending.delete(id); clearTimeout(timer); ng(e); }
+    });
+  }
+
+  // ---- 卓の画面 (app.js) が使うものを差し替える
+  const realFetch = window.fetch.bind(window);
+  window.fetch = function (input, opt) {
+    const url = typeof input === 'string' ? input : input.url;
+    if (!url.startsWith('/')) return realFetch(input, opt);
+    const path = url.split(/[?#]/)[0];
+    const m = String(opt && opt.method || 'GET').toUpperCase();
+    return request(m, path, opt && opt.body).then(r => new Response(r.bin || r.text || '', {
+      status: r.st >= 200 && r.st < 600 ? r.st : 502, headers: { 'Content-Type': r.ct || 'application/json' } }));
+  };
+  class FakeES {
+    constructor() { this.onmessage = null; this.onerror = null; this._l = {}; fakeES = this; if (ready) conn.send({ t: 'sub' }); }
+    addEventListener(t, f) { (this._l[t] = this._l[t] || []).push(f); }
+    close() { if (fakeES === this) fakeES = null; }
+    _fire(type, data) {
+      const ev = { type, data };
+      if (type === 'message' && this.onmessage) this.onmessage(ev);
+      if (type === 'error' && this.onerror) this.onerror(ev);
+      (this._l[type] || []).forEach(f => f(ev));
+    }
+  }
+  window.EventSource = FakeES;
+
+  // カードの絵: 受け取ったものを覚えて使う。まだの時は空の絵を出し、届いたら描き直す
+  const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  const imgs = new Map(); // path → blob の URL / 'wait' / 'none'
+  const queue = [];
+  let active = 0, redrawT = null;
+  function redraw() {
+    clearTimeout(redrawT);
+    redrawT = setTimeout(() => { try { if (typeof render === 'function') render(); } catch (e) { } }, 150);
+  }
+  function pump() {
+    while (ready && active < 4 && queue.length) {
+      const p = queue.shift();
+      active++;
+      request('GET', p).then(r => {
+        imgs.set(p, r.st === 200 && r.bin ? URL.createObjectURL(new Blob([r.bin], { type: r.ct || 'image/png' })) : 'none');
+        redraw();
+      }, () => imgs.delete(p)).finally(() => { active--; pump(); });
+    }
+  }
+  window.WS_REMOTE = {
+    seat: 2,
+    img(u) {
+      const p = String(u).split('?')[0];
+      const v = imgs.get(p);
+      if (v === 'none') return '';
+      if (v && v !== 'wait') return v;
+      if (!v) { imgs.set(p, 'wait'); queue.push(p); pump(); }
+      return BLANK;
+    },
+  };
+
+  async function loadApp() {
+    appLoaded = true;
+    msg('卓の画面を受け取っています…');
+    try {
+      const [html, css, js] = await Promise.all(['/index.html', '/app.css', '/app.js'].map(p =>
+        request('GET', p).then(r => { if (r.st !== 200) throw new Error(p + ' (' + r.st + ')'); return r.text; })));
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      doc.querySelectorAll('script, link').forEach(e => e.remove());
+      const st = document.createElement('style');
+      st.textContent = css;
+      document.head.appendChild(st);
+      document.body.removeAttribute('style');
+      document.body.innerHTML = doc.body.innerHTML;
+      const s = document.createElement('script');
+      s.textContent = js;
+      document.body.appendChild(s);
+    } catch (e) {
+      appLoaded = false;
+      msg('卓の画面を受け取れませんでした: ' + e.message + ' (開き直してください)');
+    }
+  }
+})();
+</script>
+</body>
+</html>
