@@ -10,6 +10,11 @@
   #wsr { padding: 16px; font: 16px/1.6 system-ui, sans-serif; }
   #wsr h2 { font-size: 19px; margin: 0 0 8px; }
   #wsrMsg { color: #ffd479; }
+  #wsrLogin { display: none; margin: 12px 0; max-width: 360px; }
+  #wsrLogin label { display: block; margin: 8px 0 2px; font-size: 14px; }
+  #wsrLogin input[type=text], #wsrLogin input[type=password] { width: 100%; box-sizing: border-box; font: 16px system-ui; padding: 8px; border-radius: 6px; border: 1px solid #4a5675; background: #121722; color: #e8ecf3; }
+  #wsrLogin .rem { display: flex; gap: 6px; align-items: center; }
+  #wsrLogin button { margin-top: 12px; width: 100%; font: bold 16px system-ui; padding: 10px; border-radius: 8px; border: 0; background: #f0b43c; color: #1d2433; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"
         integrity="sha384-nlUQ8ZqCbvStErob+biJNzSgltf6urV3VGqhfIfzhmg9RXmpeRm76ELw0pYnKlTR"
@@ -17,7 +22,13 @@
 </head>
 <body style="margin:0;background:#1d2433;color:#e8ecf3">
 <div id="wsr"><h2>WS 卓 につないでいます…</h2><div id="wsrMsg"></div>
-<p style="font-size:13px;color:#aab3c8">相手の PC の卓に、P2 としてつなぎます。PC の人から届いたリンク (#peer=…&amp;code=…) で開いてください。</p></div>
+<form id="wsrLogin" autocomplete="on">
+  <label for="wsrId">ID</label><input type="text" id="wsrId" name="username" autocomplete="username" autocapitalize="off" maxlength="20" required>
+  <label for="wsrPw">パスワード</label><input type="password" id="wsrPw" name="password" autocomplete="current-password" maxlength="100" required>
+  <label class="rem"><input type="checkbox" id="wsrRem" checked> この端末で覚える (次から入れなくてよい)</label>
+  <button type="submit">入る</button>
+</form>
+<p style="font-size:13px;color:#aab3c8">相手の PC の卓に、P2 としてつなぎます。PC の人から届いたリンク (#peer=…&amp;code=…) で開き、PC の人からもらった ID とパスワードを入れてください。</p></div>
 <script>
 // 外の相手の画面。PC の卓の画面 (index.html・app.js・app.css) は、つないでから PC から受け取って動かす
 // (ここには置かない。卓を直しても、このページを置き直す必要はない)。
@@ -34,24 +45,58 @@
   const peerId = H.get('peer') || SS.get('wsr_peer');
   const code = H.get('code') || SS.get('wsr_code');
   const msg = t => { const el = document.getElementById('wsrMsg'); if (el) el.textContent = t; };
+  const LS = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { } },
+  };
   if (!peerId || !code) { msg('リンクに #peer=… と code=… がありません'); return; }
   if (typeof Peer === 'undefined') { msg('PeerJS を読み込めませんでした (インターネットにつながっているか確かめて、開き直してください)'); return; }
 
   let conn = null, ready = false, appLoaded = false, giveUp = false, seq = 0, retryT = null, fakeES = null;
+  let dialing = null; // つないでいる途中の接続 (1本だけ。返事が無いまま20秒たったら作り直してよい)
+  // ID とパスワード。「この端末で覚える」は PC から受け取った鍵 (トークン) だけを覚える (パスワードは覚えない)
+  const AK = 'wsr_auth_' + peerId;
+  let creds = null;
+  try { const a = JSON.parse(LS.get(AK) || 'null'); if (a && a.id && a.tok) creds = { id: a.id, tok: a.tok }; } catch (e) { }
+  function askLogin(why) {
+    const f = document.getElementById('wsrLogin');
+    if (!f) return;
+    f.style.display = 'block';
+    msg(why || 'PC の人からもらった ID とパスワードを入れてください');
+    const id = document.getElementById('wsrId');
+    if (!id.value && creds) id.value = creds.id;
+    (id.value ? document.getElementById('wsrPw') : id).focus();
+  }
+  document.getElementById('wsrLogin').addEventListener('submit', e => {
+    e.preventDefault();
+    const id = document.getElementById('wsrId').value.trim(), pw = document.getElementById('wsrPw').value;
+    if (!id || !pw) return;
+    creds = { id, pw, remember: document.getElementById('wsrRem').checked };
+    document.getElementById('wsrLogin').style.display = 'none';
+    document.getElementById('wsrPw').value = '';
+    msg('つないでいます…');
+    giveUp = false;
+    if (peer.open) dial();
+  });
   const pending = new Map();
   const peer = new Peer({ debug: 1 });
 
   function retry(ms) { clearTimeout(retryT); if (!giveUp) retryT = setTimeout(dial, ms); }
   function dial() {
-    if (giveUp || ready) return;
+    if (giveUp || ready || !creds) return; // ID とパスワードを入れるまでつながない
     if (peer.disconnected) { peer.reconnect(); return; } // open の後にもう一度 dial する
+    if (dialing && !dialing._dead && Date.now() - dialing._t < 20000) return;
     const c = peer.connect(peerId, { reliable: true });
-    c.on('open', () => c.send({ t: 'hello', code }));
+    c._t = Date.now();
+    dialing = c;
+    c.on('open', () => c.send(Object.assign({ t: 'hello', code }, creds)));
     c.on('data', d => onData(c, d));
     c.on('close', () => onClose(c));
     c.on('error', () => onClose(c));
   }
   peer.on('open', dial);
+  if (!creds) askLogin();
   peer.on('disconnected', () => { if (!peer.destroyed) setTimeout(() => peer.reconnect(), 3000); });
   peer.on('error', e => {
     const t = e && e.type;
@@ -62,10 +107,21 @@
 
   function onData(c, d) {
     if (!d || typeof d !== 'object') return;
+    // 今の接続でもつないでいる途中の接続でもない (古い) 接続からの知らせは無視して閉じる
+    if (c !== conn && c !== dialing) { try { c.close(); } catch (e) { } return; }
     if (d.t === 'ok') {
+      if (dialing === c) dialing = null;
+      if (d.tok && creds) { LS.set(AK, JSON.stringify({ id: creds.id, tok: d.tok })); creds = { id: creds.id, tok: d.tok }; }
       conn = c; ready = true;
       if (!appLoaded) loadApp(); else if (fakeES) c.send({ t: 'sub' });
       pump();
+    } else if (d.t === 'auth_ng') { // ID・パスワード (覚えた鍵) が違う
+      if (dialing === c) dialing = null;
+      ready = false;
+      if (creds && creds.tok) LS.del(AK);
+      creds = null;
+      try { c.close(); } catch (e) { }
+      if (appLoaded) { giveUp = true; alert(d.why + '\nページを開き直して、入り直してください'); } else askLogin(d.why);
     } else if (d.t === 'bye') {
       giveUp = true; ready = false;
       if (appLoaded) alert(d.why); else msg(d.why);
@@ -77,6 +133,8 @@
     }
   }
   function onClose(c) {
+    c._dead = true;
+    if (dialing === c) dialing = null;
     if (c === conn) {
       conn = null; ready = false;
       for (const p of pending.values()) { clearTimeout(p.timer); p.ng(new Error('切れました')); }
