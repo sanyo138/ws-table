@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#1d2433">
 <meta name="referrer" content="no-referrer">
-<title>WS 卓 (外から P2)</title>
+<title>WS 卓 (外から)</title>
 <style>
   #wsr { padding: 16px; font: 16px/1.6 system-ui, sans-serif; }
   #wsr h2 { font-size: 19px; margin: 0 0 8px; }
@@ -28,7 +28,7 @@
   <label class="rem"><input type="checkbox" id="wsrRem" checked> この端末で覚える (次から入れなくてよい)</label>
   <button type="submit">入る</button>
 </form>
-<p style="font-size:13px;color:#aab3c8">相手の PC の卓に、P2 としてつなぎます。PC の人から届いたリンク (#peer=…&amp;code=…) で開き、PC の人からもらった ID とパスワードを入れてください。</p></div>
+<p style="font-size:13px;color:#aab3c8">PC の卓に外からつなぎます。PC の人から届いたリンク (#peer=…&amp;code=…) で開き、PC の人からもらった ID とパスワードを入れてください。入ると初めは観戦で、P1・P2 の席は入ったあとで選べます。</p></div>
 <script>
 // 外の相手の画面。PC の卓の画面 (index.html・app.js・app.css) は、つないでから PC から受け取って動かす
 // (ここには置かない。卓を直しても、このページを置き直す必要はない)。
@@ -39,6 +39,7 @@
   const SS = {
     get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { sessionStorage.setItem(k, v); } catch (e) { } },
+    del(k) { try { sessionStorage.removeItem(k); } catch (e) { } },
   };
   // 卓の中の「使い方を変える」などでアドレスの # が消えても、同じタブなら続けられるように覚えておく
   if (H.get('peer') && H.get('code')) { SS.set('wsr_peer', H.get('peer')); SS.set('wsr_code', H.get('code')); }
@@ -55,10 +56,11 @@
 
   let conn = null, ready = false, appLoaded = false, giveUp = false, seq = 0, retryT = null, fakeES = null;
   let dialing = null; // つないでいる途中の接続 (1本だけ。返事が無いまま20秒たったら作り直してよい)
-  // ID とパスワード。「この端末で覚える」は PC から受け取った鍵 (トークン) だけを覚える (パスワードは覚えない)
+  // ID とパスワード。「この端末で覚える」は PC から受け取った鍵 (トークン) だけを覚える (パスワードは覚えない)。
+  // 覚えない時も、このタブの間だけの鍵を受け取る (席を替えて開き直す時に、パスワードを聞き直さないため)
   const AK = 'wsr_auth_' + peerId;
   let creds = null;
-  try { const a = JSON.parse(LS.get(AK) || 'null'); if (a && a.id && a.tok) creds = { id: a.id, tok: a.tok }; } catch (e) { }
+  try { const a = JSON.parse(LS.get(AK) || SS.get(AK) || 'null'); if (a && a.id && a.tok) creds = { id: a.id, tok: a.tok }; } catch (e) { }
   function askLogin(why) {
     const f = document.getElementById('wsrLogin');
     if (!f) return;
@@ -111,14 +113,18 @@
     if (c !== conn && c !== dialing) { try { c.close(); } catch (e) { } return; }
     if (d.t === 'ok') {
       if (dialing === c) dialing = null;
-      if (d.tok && creds) { LS.set(AK, JSON.stringify({ id: creds.id, tok: d.tok })); creds = { id: creds.id, tok: d.tok }; }
+      if (d.tok && creds) { (d.keep || d.v < 3 ? LS : SS).set(AK, JSON.stringify({ id: creds.id, tok: d.tok })); creds = { id: creds.id, tok: d.tok }; }
       conn = c; ready = true;
+      const seat = [0, 1, 2, 3].includes(d.seat) ? d.seat : 2;
+      if (appLoaded && seat !== window.WS_REMOTE.seat) { location.reload(); return; } // つなぎ直したら席が変わっていた
+      window.WS_REMOTE.seat = seat;
+      window.WS_REMOTE.owner = !!d.owner;
       if (!appLoaded) loadApp(); else if (fakeES) c.send({ t: 'sub' });
       pump();
     } else if (d.t === 'auth_ng') { // ID・パスワード (覚えた鍵) が違う
       if (dialing === c) dialing = null;
       ready = false;
-      if (creds && creds.tok) LS.del(AK);
+      if (creds && creds.tok) { LS.del(AK); SS.del(AK); }
       creds = null;
       try { c.close(); } catch (e) { }
       if (appLoaded) { giveUp = true; alert(d.why + '\nページを開き直して、入り直してください'); } else askLogin(d.why);
@@ -197,7 +203,8 @@
     }
   }
   window.WS_REMOTE = {
-    seat: 2,
+    seat: 3, // 席 (0 一人回し / 1 P1 / 2 P2 / 3 観戦)。入った時に PC の卓から受け取る。替わったらページを開き直す
+    owner: false,
     img(u) {
       const p = String(u).split('?')[0];
       const v = imgs.get(p);
